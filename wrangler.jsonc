@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "hirose",
-  "main": "src/index.js",
+  "main": "Worker.js",
   "compatibility_date": "2026-11-21",
   "kv_namespaces": [
     {
