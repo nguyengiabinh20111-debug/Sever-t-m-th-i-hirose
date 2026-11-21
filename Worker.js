@@ -1,10 +1,14 @@
-const messages = [];
-const users = new Map();
-const reactions = {};
-let nextId = 1;
+const memoryStore = {
+  messages: [],
+  users: new Map(),
+  nextId: 1
+};
 
-function jsonRes(data, status = 200) {
-  return new Response(JSON.stringify(data), {
+const MAX_MESSAGES = 60;
+const TTL_SECONDS = 1800;
+
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
@@ -15,79 +19,129 @@ function jsonRes(data, status = 200) {
   });
 }
 
-function cleanupOld() {
-  const now = Math.floor(Date.now() / 1000);
-  for (const [k, v] of users.entries()) {
-    if (now - v.lastSeen > 120) users.delete(k);
+async function loadMessages(env) {
+  if (env && env.CHAT_KV) {
+    const raw = await env.CHAT_KV.get("messages_v1", "json");
+    if (raw && Array.isArray(raw.items)) {
+      return { items: raw.items, nextId: Number(raw.nextId) || 1 };
+    }
+    return { items: [], nextId: 1 };
   }
-  while (messages.length > 150) messages.shift();
+  return { items: memoryStore.messages, nextId: memoryStore.nextId };
+}
+
+async function saveMessages(env, state) {
+  const trimmed = state.items.slice(-MAX_MESSAGES);
+  const nextState = { items: trimmed, nextId: state.nextId };
+  memoryStore.messages = trimmed;
+  memoryStore.nextId = state.nextId;
+
+  if (env && env.CHAT_KV) {
+    await env.CHAT_KV.put("messages_v1", JSON.stringify(nextState), {
+      expirationTtl: TTL_SECONDS
+    });
+  }
+}
+
+function cleanupAndListUsers(body) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (body && body.user) {
+    const uname = String(body.user).slice(0, 40);
+    if (uname && uname !== "Player") {
+      memoryStore.users.set(uname, {
+        user: uname,
+        displayName: String(body.displayName || uname).slice(0, 40),
+        userId: Number(body.userId) || 0,
+        server: String(body.server || "Global").slice(0, 20),
+        seenAt: nowSec
+      });
+    }
+  }
+
+  const active = [];
+  for (const [key, info] of memoryStore.users.entries()) {
+    if (nowSec - info.seenAt > 120) {
+      memoryStore.users.delete(key);
+    } else {
+      active.push({
+        user: info.user,
+        displayName: info.displayName,
+        userId: info.userId,
+        server: info.server
+      });
+    }
+  }
+  return active;
 }
 
 export default {
-  async fetch(request) {
-    if (request.method === "OPTIONS") return jsonRes({ ok: true });
-    cleanupOld();
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return jsonResponse({ ok: true });
+    }
+
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (request.method === "GET" && path === "/messages") {
-      const after = Number(url.searchParams.get("after") || 0);
-      const list = after > 0 ? messages.filter((m) => m.id > after) : messages.slice(-40);
-      return jsonRes({
+      const afterId = Number(url.searchParams.get("after") || "0") || 0;
+      const state = await loadMessages(env);
+      const filtered = afterId > 0
+        ? state.items.filter((m) => Number(m.id) > afterId)
+        : state.items;
+
+      return jsonResponse({
         ok: true,
-        messages: list,
-        users: Array.from(users.values()),
-        reactions
+        messages: filtered,
+        latestId: state.nextId - 1
       });
     }
 
     if (request.method === "POST" && path === "/send") {
-      const body = await request.json().catch(() => ({}));
-      const text = String(body.text || "").trim().slice(0, 200);
-      if (!text) return jsonRes({ ok: false, error: "empty" }, 400);
-      const user = String(body.user || "Player").slice(0, 40);
-      const displayName = String(body.displayName || user).slice(0, 40);
-      const userId = Number(body.userId || 0);
-      const now = Math.floor(Date.now() / 1000);
-      if (user && user !== "Player") {
-        users.set(user, { user, displayName, userId, lastSeen: now });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON" }, 400);
       }
+
+      const text = String(body.text || "").trim().slice(0, 200);
+      if (!text) {
+        return jsonResponse({ ok: false, error: "Empty message" }, 400);
+      }
+
+      const state = await loadMessages(env);
       const msg = {
-        id: nextId++,
-        user,
-        displayName,
-        userId,
+        id: state.nextId++,
+        user: String(body.user || "Player").slice(0, 40),
+        displayName: String(body.displayName || body.user || "Player").slice(0, 40),
+        userId: Number(body.userId) || 0,
         text,
-        time: now,
-        server: String(body.server || "Global")
+        time: Number(body.time) || Math.floor(Date.now() / 1000),
+        server: String(body.server || "Global").slice(0, 20)
       };
-      messages.push(msg);
-      return jsonRes({ ok: true, id: msg.id });
+
+      state.items.push(msg);
+      await saveMessages(env, state);
+
+      return jsonResponse({ ok: true, id: msg.id, message: msg });
     }
 
     if (request.method === "POST" && path === "/ping") {
-      const body = await request.json().catch(() => ({}));
-      const user = String(body.user || "").trim();
-      const now = Math.floor(Date.now() / 1000);
-      if (user && user !== "Player") {
-        users.set(user, {
-          user,
-          displayName: String(body.displayName || user),
-          userId: Number(body.userId || 0),
-          lastSeen: now
-        });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
       }
-      return jsonRes({ ok: true, users: Array.from(users.values()) });
+      const users = cleanupAndListUsers(body);
+      return jsonResponse({ ok: true, users });
     }
 
-    if (request.method === "POST" && path === "/react") {
-      const body = await request.json().catch(() => ({}));
-      const mid = Number(body.messageId || 0);
-      const emoji = String(body.emoji || "").trim();
-      if (mid > 0 && emoji) reactions[String(mid)] = emoji;
-      return jsonRes({ ok: true });
-    }
-
-    return jsonRes({ ok: true, status: "Hirose temp chat online" });
+    return jsonResponse({
+      ok: true,
+      service: "hirose-chat-api",
+      kvEnabled: Boolean(env && env.CHAT_KV)
+    });
   }
 };
